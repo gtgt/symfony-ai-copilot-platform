@@ -1,0 +1,52 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Symfony\Component\Config\Definition\Configurator;
+
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+
+return (new ArrayNodeDefinition('cli'))
+    ->canBeDisabled()
+    ->children()
+        ->scalarNode('token')
+            ->defaultNull()
+            ->info('GitHub token (GH_TOKEN / GITHUB_TOKEN); omit when using an existing "gh auth login" session')
+        ->end()
+        ->scalarNode('binary')
+            ->defaultValue('copilot')
+            ->info('GitHub Copilot CLI binary name (default: copilot)')
+        ->end()
+        ->scalarNode('workspace')
+            ->defaultNull()
+            ->info('Working directory for the copilot process; defaults to project dir when null')
+        ->end()
+        ->booleanNode('yolo')
+            ->defaultFalse()
+            ->info('Pass --yolo to auto-approve all tool calls without prompts')
+        ->end()
+        ->integerNode('timeout')
+            ->defaultValue(600)
+            ->min(1)
+            ->info('Process timeout in seconds (default: 600)')
+        ->end()
+        ->arrayNode('available_tools')
+            ->scalarPrototype()->end()
+            ->defaultValue([])
+            ->info('Comma-separated list of tools the model is allowed to use (--available-tools). Supports glob patterns for shell commands.')
+        ->end()
+        ->arrayNode('excluded_tools')
+            ->scalarPrototype()->end()
+            ->defaultValue([])
+            ->info('Tools to exclude from use (--excluded-tools)')
+        ->end()
+        ->scalarNode('config_dir')
+            ->defaultNull()
+            ->info('Override the default Copilot config directory (~/.copilot) via --config-dir')
+        ->end()
+        ->arrayNode('extra_args')
+            ->scalarPrototype()->end()
+            ->defaultValue([])
+            ->info('Additional CLI arguments appended to every copilot invocation')
+        ->end()
+    ->end();
