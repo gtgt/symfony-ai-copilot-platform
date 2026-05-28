@@ -61,11 +61,11 @@ final class ResultConverter implements ResultConverterInterface
 
         $subtype = (string) ($data['subtype'] ?? '');
         if ('error_during_generation' === $subtype || true === ($data['is_error'] ?? false)) {
-            throw new RuntimeException((string) ($data['error'] ?? $data['result'] ?? 'GitHub Copilot CLI agent run failed.'));
+            throw new RuntimeException((string) ($data['error'] ?? $data['content'] ?? 'GitHub Copilot CLI agent run failed.'));
         }
 
-        if (!isset($data['result'])) {
-            throw new RuntimeException('Unexpected Copilot CLI JSON response: missing "result" field.');
+        if (!isset($data['content'])) {
+            throw new RuntimeException('Unexpected Copilot CLI JSON response: missing "content" field.');
         }
 
         $results = [];
@@ -82,7 +82,7 @@ final class ResultConverter implements ResultConverterInterface
             )]);
         }
 
-        $results[] = new TextResult((string) $data['result']);
+        $results[] = new TextResult((string) $data['content']);
 
         $finalResult = 1 === \count($results) ? $results[0] : new MultiPartResult($results);
         $this->attachMetadata($finalResult, $data);
@@ -173,8 +173,8 @@ final class ResultConverter implements ResultConverterInterface
                             static fn (array $tc) => new ToolCall($tc['id'], $tc['name'], $tc['arguments']),
                             array_values($pendingToolCalls),
                         );
-                        yield new ToolCallComplete($toolCalls);
                         $pendingToolCalls = [];
+                        yield new ToolCallComplete($toolCalls);
                     }
 
                     foreach (['session_id', 'request_id', 'duration_ms'] as $key) {
@@ -187,8 +187,8 @@ final class ResultConverter implements ResultConverterInterface
                         yield new MetadataDelta('token_usage', $tokenUsage);
                     }
 
-                    if (isset($event['result']) && \is_string($event['result']) && '' !== $event['result']) {
-                        yield new TextDelta($event['result']);
+                    if (isset($event['content']) && \is_string($event['content']) && '' !== $event['content']) {
+                        yield new TextDelta($event['content']);
                     }
                     return;
 
@@ -220,11 +220,10 @@ final class ResultConverter implements ResultConverterInterface
             return null;
         }
 
-        // Support both snake_case (copilot CLI) and camelCase (Cursor-compatible) field names.
-        $input = isset($usage['input_tokens']) ? (int) $usage['input_tokens'] : (isset($usage['inputTokens']) ? (int) $usage['inputTokens'] : null);
-        $output = isset($usage['output_tokens']) ? (int) $usage['output_tokens'] : (isset($usage['outputTokens']) ? (int) $usage['outputTokens'] : null);
-        $cacheRead = isset($usage['cache_read_input_tokens']) ? (int) $usage['cache_read_input_tokens'] : (isset($usage['cacheReadTokens']) ? (int) $usage['cacheReadTokens'] : null);
-        $cacheWrite = isset($usage['cache_creation_input_tokens']) ? (int) $usage['cache_creation_input_tokens'] : (isset($usage['cacheWriteTokens']) ? (int) $usage['cacheWriteTokens'] : null);
+        $input = isset($usage['inputTokens']) ? (int) $usage['inputTokens'] : null;
+        $output = isset($usage['outputTokens']) ? (int) $usage['outputTokens'] : null;
+        $cacheRead = isset($usage['cacheReadTokens']) ? (int) $usage['cacheReadTokens'] : null;
+        $cacheWrite = isset($usage['cacheWriteTokens']) ? (int) $usage['cacheWriteTokens'] : null;
 
         if (null === $input && null === $output && null === $cacheRead && null === $cacheWrite) {
             return null;

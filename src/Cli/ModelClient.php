@@ -15,10 +15,10 @@ use Symfony\Component\Process\Process;
  * Maps each Platform invocation to the GitHub Copilot CLI ({@code copilot --prompt "..." --output-format json}).
  *
  * Authentication is handled via environment variables:
- *   - GH_TOKEN / GITHUB_TOKEN — personal access token or GitHub App user token
+ *   - GITHUB_TOKEN — personal access token or GitHub App user token
  *   - COPILOT_GITHUB_TOKEN    — copilot-specific override
  *
- * The CLI can also use an existing interactive login session from {@code gh auth login}.
+ * The CLI can also use an existing interactive login session from {@code copilot login}.
  */
 final class ModelClient implements ModelClientInterface
 {
@@ -78,7 +78,7 @@ final class ModelClient implements ModelClientInterface
         }
 
         // --prompt and --output-format json are always present for headless mode.
-        $command = [$binary, '--prompt', $prompt, '--output-format', 'json'];
+        $command = [$binary, '--prompt', $prompt, '--output-format', 'json', '--stream', ($options['stream'] ?? false) ? 'on' : 'off'];
 
         $modelName = $model->getName();
         if ('default' !== $modelName) {

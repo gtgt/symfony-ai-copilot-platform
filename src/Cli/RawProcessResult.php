@@ -55,8 +55,8 @@ final class RawProcessResult implements RawResultInterface
 
             $type = $event['type'] ?? null;
 
-            if ('result' === $type) {
-                $result = $event;
+            if (in_array($type, ['result', 'assistant.message'])) {
+                $result += $event['data'] ?? $event;
                 continue;
             }
 
@@ -73,7 +73,6 @@ final class RawProcessResult implements RawResultInterface
                 $callId = (string) ($event['tool_use_id'] ?? '');
                 if ('' !== $callId && isset($pendingToolUse[$callId])) {
                     $entry = $pendingToolUse[$callId];
-                    $entry['result'] = $event['content'] ?? null;
                     $toolCalls[] = $entry;
                     unset($pendingToolUse[$callId]);
                 }
