@@ -11,15 +11,26 @@ use Symfony\Component\Process\Process;
 /**
  * Wraps a Symfony Process running the GitHub Copilot CLI as a RawResultInterface.
  *
- * The CLI with {@code --output-format json} emits JSONL (newline-delimited JSON).
+ * The CLI emits JSONL (newline-delimited JSON) with the following event types:
  *
- * Expected event types:
- *  - {"type":"system","subtype":"init","session_id":"...","model":"...","cwd":"..."}
- *  - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
- *  - {"type":"tool_use","id":"...","name":"...","input":{...}}
- *  - {"type":"tool_result","tool_use_id":"...","content":"..."}
- *  - {"type":"result","subtype":"success","result":"final text","usage":{"input_tokens":N,"output_tokens":N}}
- *  - {"type":"result","subtype":"error_during_generation","error":"..."}
+ *  Session/lifecycle events (ephemeral metadata):
+ *  - {"type":"session.mcp_server_status_changed","data":{...}}
+ *  - {"type":"session.mcp_servers_loaded","data":{...}}
+ *  - {"type":"session.skills_loaded","data":{...}}
+ *  - {"type":"session.tools_updated","data":{...}}
+ *
+ *  Conversation events:
+ *  - {"type":"user.message","data":{"content":"...","interactionId":"...",...}}
+ *  - {"type":"assistant.turn_start","data":{"turnId":"...","interactionId":"..."}}
+ *  - {"type":"assistant.reasoning_delta","data":{"reasoningId":"...","deltaContent":"..."}} (streaming)
+ *  - {"type":"assistant.message_start","data":{"messageId":"..."}} (streaming)
+ *  - {"type":"assistant.message_delta","data":{"messageId":"...","deltaContent":"..."}} (streaming)
+ *  - {"type":"assistant.message","data":{"content":"...","model":"...","outputTokens":N,"reasoningText":"...","reasoningOpaque":"...","toolRequests":[...],...}}
+ *  - {"type":"assistant.reasoning","data":{"reasoningId":"...","content":"..."}} (ephemeral full reasoning)
+ *  - {"type":"assistant.turn_end","data":{"turnId":"..."}}
+ *
+ *  Terminal event:
+ *  - {"type":"result","sessionId":"...","exitCode":0,"usage":{"premiumRequests":N,"totalApiDurationMs":N,...}}
  */
 final class RawProcessResult implements RawResultInterface
 {
@@ -30,6 +41,10 @@ final class RawProcessResult implements RawResultInterface
 
     /**
      * Waits for the process to finish and returns the parsed terminal result event.
+     *
+     * Merges data from the {@code assistant.message} event (content, model, tokens, reasoning,
+     * tool requests) with the {@code result} event (session ID, CLI-level usage) into a single
+     * normalized array consumed by {@see ResultConverter::convert()}.
      *
      * @return array<string, mixed>
      */
@@ -43,9 +58,10 @@ final class RawProcessResult implements RawResultInterface
             throw new RuntimeException('GitHub Copilot CLI returned empty output.');
         }
 
-        $result = [];
-        $toolCalls = [];
-        $pendingToolUse = [];
+        /** @var array<string, mixed>|null $assistantData */
+        $assistantData = null;
+        /** @var array<string, mixed>|null $resultEvent */
+        $resultEvent = null;
 
         foreach (self::splitLines($stdout) as $line) {
             $event = json_decode($line, true);
@@ -55,39 +71,57 @@ final class RawProcessResult implements RawResultInterface
 
             $type = $event['type'] ?? null;
 
-            if (in_array($type, ['result', 'assistant.message'])) {
-                $result += $event['data'] ?? $event;
+            if ('assistant.message' === $type && \is_array($event['data'] ?? null)) {
+                // Use the last assistant.message in case of multi-turn output.
+                $assistantData = $event['data'];
+            }
+
+            if ('result' === $type) {
+                $resultEvent = $event;
+            }
+        }
+
+        if (null === $assistantData && null === $resultEvent) {
+            throw new RuntimeException('GitHub Copilot CLI stream ended without a terminal result event.');
+        }
+
+        $ad = $assistantData ?? [];
+
+        // Normalise tool requests from the Copilot-native format to a portable tool_calls array.
+        $toolCalls = [];
+        foreach ((array) ($ad['toolRequests'] ?? []) as $req) {
+            if (!\is_array($req)) {
                 continue;
             }
-
-            if ('tool_use' === $type) {
-                $callId = (string) ($event['id'] ?? '');
-                $name = (string) ($event['name'] ?? '');
-                $input = \is_array($event['input'] ?? null) ? $event['input'] : [];
-                if ('' !== $callId) {
-                    $pendingToolUse[$callId] = ['id' => $callId, 'name' => $name, 'arguments' => $input];
-                }
-            }
-
-            if ('tool_result' === $type) {
-                $callId = (string) ($event['tool_use_id'] ?? '');
-                if ('' !== $callId && isset($pendingToolUse[$callId])) {
-                    $entry = $pendingToolUse[$callId];
-                    $toolCalls[] = $entry;
-                    unset($pendingToolUse[$callId]);
-                }
-            }
+            $toolCalls[] = [
+                'id' => (string) ($req['id'] ?? ''),
+                'name' => (string) ($req['name'] ?? $req['toolName'] ?? ''),
+                'arguments' => \is_array($req['arguments'] ?? null) ? $req['arguments'] : (\is_array($req['input'] ?? null) ? $req['input'] : []),
+            ];
         }
 
-        if ([] === $result) {
-            throw new RuntimeException('GitHub Copilot CLI stream ended without a terminal "result" event.');
-        }
-
-        if ([] !== $toolCalls) {
-            $result['tool_calls'] = $toolCalls;
-        }
-
-        return $result;
+        return [
+            'content' => (string) ($ad['content'] ?? ''),
+            'reasoningText' => isset($ad['reasoningText']) && '' !== $ad['reasoningText'] ? (string) $ad['reasoningText'] : null,
+            'reasoningOpaque' => isset($ad['reasoningOpaque']) && '' !== $ad['reasoningOpaque'] ? (string) $ad['reasoningOpaque'] : null,
+            'model' => isset($ad['model']) ? (string) $ad['model'] : null,
+            'messageId' => isset($ad['messageId']) ? (string) $ad['messageId'] : null,
+            'requestId' => isset($ad['requestId']) ? (string) $ad['requestId'] : null,
+            'serviceRequestId' => isset($ad['serviceRequestId']) ? (string) $ad['serviceRequestId'] : null,
+            'sessionId' => isset($resultEvent['sessionId']) ? (string) $resultEvent['sessionId'] : null,
+            'exitCode' => (int) ($resultEvent['exitCode'] ?? 0),
+            // Token usage: outputTokens is on assistant.message.data; input tokens are not reported.
+            'usage' => [
+                'outputTokens' => isset($ad['outputTokens']) ? (int) $ad['outputTokens'] : null,
+            ],
+            // CLI-level billing/timing stats from the result event (not token counts).
+            // Each field is stored individually so ResultConverter can add them as named metadata.
+            'premiumRequests' => isset($resultEvent['usage']['premiumRequests']) ? $resultEvent['usage']['premiumRequests'] : null,
+            'totalApiDurationMs' => isset($resultEvent['usage']['totalApiDurationMs']) ? (int) $resultEvent['usage']['totalApiDurationMs'] : null,
+            'sessionDurationMs' => isset($resultEvent['usage']['sessionDurationMs']) ? (int) $resultEvent['usage']['sessionDurationMs'] : null,
+            'codeChanges' => \is_array($resultEvent['usage']['codeChanges'] ?? null) ? $resultEvent['usage']['codeChanges'] : null,
+            'tool_calls' => $toolCalls,
+        ];
     }
 
     /**

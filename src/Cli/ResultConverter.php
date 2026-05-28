@@ -7,16 +7,20 @@ namespace Symfony\AI\Platform\Bridge\Copilot\Cli;
 use Symfony\AI\Platform\Exception\RuntimeException;
 use Symfony\AI\Platform\Model;
 use Symfony\AI\Platform\Result\MultiPartResult;
+use Symfony\AI\Platform\Result\ObjectResult;
 use Symfony\AI\Platform\Result\RawResultInterface;
 use Symfony\AI\Platform\Result\ResultInterface;
 use Symfony\AI\Platform\Result\Stream\Delta\MetadataDelta;
 use Symfony\AI\Platform\Result\Stream\Delta\TextDelta;
+use Symfony\AI\Platform\Result\Stream\Delta\ThinkingComplete;
 use Symfony\AI\Platform\Result\Stream\Delta\ThinkingDelta;
+use Symfony\AI\Platform\Result\Stream\Delta\ThinkingSignature;
+use Symfony\AI\Platform\Result\Stream\Delta\ThinkingStart;
 use Symfony\AI\Platform\Result\Stream\Delta\ToolCallComplete;
 use Symfony\AI\Platform\Result\Stream\Delta\ToolCallStart;
-use Symfony\AI\Platform\Result\Stream\Delta\ToolInputDelta;
 use Symfony\AI\Platform\Result\StreamResult;
 use Symfony\AI\Platform\Result\TextResult;
+use Symfony\AI\Platform\Result\ThinkingResult;
 use Symfony\AI\Platform\Result\ToolCall;
 use Symfony\AI\Platform\Result\ToolCallResult;
 use Symfony\AI\Platform\ResultConverterInterface;
@@ -32,7 +36,7 @@ use Symfony\AI\Platform\TokenUsage\TokenUsageExtractorInterface;
 final class ResultConverter implements ResultConverterInterface
 {
     private const METADATA_FIELDS = [
-        'session_id', 'request_id', 'duration_ms', 'model',
+        'sessionId', 'model', 'messageId', 'requestId', 'serviceRequestId',
     ];
 
     private readonly TokenUsageExtractorInterface $tokenUsageExtractor;
@@ -59,16 +63,24 @@ final class ResultConverter implements ResultConverterInterface
             throw new RuntimeException('GitHub Copilot CLI did not return any result.');
         }
 
-        $subtype = (string) ($data['subtype'] ?? '');
-        if ('error_during_generation' === $subtype || true === ($data['is_error'] ?? false)) {
+        if (0 !== (int) ($data['exitCode'] ?? 0) || true === ($data['is_error'] ?? false)) {
             throw new RuntimeException((string) ($data['error'] ?? $data['content'] ?? 'GitHub Copilot CLI agent run failed.'));
         }
 
-        if (!isset($data['content'])) {
+        if (!isset($data['content']) || '' === $data['content']) {
             throw new RuntimeException('Unexpected Copilot CLI JSON response: missing "content" field.');
         }
 
         $results = [];
+
+        // Include thinking/reasoning as a ThinkingResult when present.
+        if (isset($data['reasoningText']) && '' !== (string) $data['reasoningText']) {
+            $results[] = new ThinkingResult(
+                (string) $data['reasoningText'],
+                isset($data['reasoningOpaque']) ? (string) $data['reasoningOpaque'] : null,
+            );
+        }
+
         foreach ($data['tool_calls'] ?? [] as $toolCall) {
             if (!\is_array($toolCall) || !isset($toolCall['id'], $toolCall['name'])) {
                 continue;
@@ -100,99 +112,144 @@ final class ResultConverter implements ResultConverterInterface
      */
     private function convertStream(RawResultInterface $result): \Generator
     {
-        /** @var array<string, array{id: string, name: string, arguments: array<string, mixed>}> $pendingToolCalls */
-        $pendingToolCalls = [];
+        $thinkingStarted = false;
+        $thinkingComplete = false;
+        $accumulatedThinking = '';
+        $textDeltaSeen = false;
 
         foreach ($result->getDataStream() as $event) {
-            $type = $event['type'] ?? null;
-            $subtype = $event['subtype'] ?? null;
+            $type = (string) ($event['type'] ?? '');
+            /** @var array<string, mixed> $data */
+            $data = \is_array($event['data'] ?? null) ? $event['data'] : [];
+
+            // session.* events carry lifecycle/connection metadata — emit as ObjectResult-like metadata.
+            if (str_starts_with($type, 'session.')) {
+                yield new MetadataDelta($type, [] !== $data ? $data : null);
+                continue;
+            }
 
             switch ($type) {
-                case 'system':
-                    if ('init' === $subtype) {
-                        yield new MetadataDelta('session', [
-                            'session_id' => $event['session_id'] ?? null,
-                            'model' => $event['model'] ?? null,
-                            'cwd' => $event['cwd'] ?? null,
-                        ]);
+                case 'user.message':
+                    // Not assistant output; skip.
+                    break;
+
+                case 'assistant.turn_start':
+                    yield new MetadataDelta('turn_start', $data);
+                    break;
+
+                case 'assistant.reasoning_delta':
+                    // Incremental thinking content (streaming mode).
+                    if (!$thinkingStarted) {
+                        yield new ThinkingStart();
+                        $thinkingStarted = true;
+                    }
+                    $delta = (string) ($data['deltaContent'] ?? '');
+                    $accumulatedThinking .= $delta;
+                    yield new ThinkingDelta($delta);
+                    break;
+
+                case 'assistant.message_start':
+                    // Reasoning is finished, text message is beginning.
+                    if ($thinkingStarted) {
+                        yield new ThinkingComplete($accumulatedThinking);
+                        $thinkingStarted = false;
+                        $thinkingComplete = true;
+                        $accumulatedThinking = '';
                     }
                     break;
 
-                case 'thinking':
-                    yield new ThinkingDelta((string) ($event['thinking'] ?? $event['text'] ?? ''));
+                case 'assistant.message_delta':
+                    // Incremental text content (streaming mode).
+                    $textDeltaSeen = true;
+                    yield new TextDelta((string) ($data['deltaContent'] ?? ''));
                     break;
 
-                case 'assistant':
-                    $content = $event['message']['content'] ?? $event['content'] ?? [];
-                    if (\is_array($content)) {
-                        foreach ($content as $block) {
-                            if (\is_array($block)) {
-                                if ('text' === ($block['type'] ?? null) && isset($block['text'])) {
-                                    yield new TextDelta((string) $block['text']);
-                                } elseif ('thinking' === ($block['type'] ?? null) && isset($block['thinking'])) {
-                                    yield new ThinkingDelta((string) $block['thinking']);
-                                }
-                            } elseif (\is_string($block)) {
-                                yield new TextDelta($block);
+                case 'assistant.message':
+                    // Full message event — always present, streaming or not.
+
+                    // Non-streaming mode: no reasoning_delta events were emitted, yield full thinking now.
+                    if (!$thinkingComplete && '' !== (string) ($data['reasoningText'] ?? '')) {
+                        yield new ThinkingStart();
+                        yield new ThinkingDelta((string) $data['reasoningText']);
+                        yield new ThinkingComplete(
+                            (string) $data['reasoningText'],
+                            isset($data['reasoningOpaque']) && '' !== $data['reasoningOpaque']
+                                ? (string) $data['reasoningOpaque'] : null,
+                        );
+                        $thinkingComplete = true;
+                    } elseif ($thinkingComplete && isset($data['reasoningOpaque']) && '' !== (string) $data['reasoningOpaque']) {
+                        // Streaming mode: thinking was emitted incrementally; attach the opaque signature now.
+                        yield new ThinkingSignature((string) $data['reasoningOpaque']);
+                    }
+
+                    // Non-streaming mode: no message_delta events; yield the full content as a single delta.
+                    if (!$textDeltaSeen && '' !== (string) ($data['content'] ?? '')) {
+                        yield new TextDelta((string) $data['content']);
+                    }
+
+                    // Emit tool call events if the model requested any tools.
+                    $toolRequests = \is_array($data['toolRequests'] ?? null) ? $data['toolRequests'] : [];
+                    if ([] !== $toolRequests) {
+                        $toolCalls = [];
+                        foreach ($toolRequests as $req) {
+                            if (!\is_array($req)) {
+                                continue;
+                            }
+                            $callId = (string) ($req['id'] ?? '');
+                            $name = (string) ($req['name'] ?? $req['toolName'] ?? '');
+                            /** @var array<string, mixed> $args */
+                            $args = \is_array($req['arguments'] ?? null) ? $req['arguments'] : (\is_array($req['input'] ?? null) ? $req['input'] : []);
+                            if ('' !== $callId) {
+                                yield new ToolCallStart($callId, $name);
+                                $toolCalls[] = new ToolCall($callId, $name, $args);
                             }
                         }
-                    } elseif (\is_string($content)) {
-                        yield new TextDelta($content);
-                    }
-                    break;
-
-                case 'tool_use':
-                    $callId = (string) ($event['id'] ?? '');
-                    $name = (string) ($event['name'] ?? '');
-                    /** @var array<string, mixed> $args */
-                    $args = \is_array($event['input'] ?? null) ? $event['input'] : [];
-
-                    if ('' !== $callId) {
-                        $pendingToolCalls[$callId] = ['id' => $callId, 'name' => $name, 'arguments' => $args];
-                        yield new ToolCallStart($callId, $name);
-                        if ([] !== $args) {
-                            try {
-                                yield new ToolInputDelta($callId, $name, json_encode($args, \JSON_THROW_ON_ERROR));
-                            } catch (\JsonException) {
-                                // ignore; tool args could not be re-encoded
-                            }
+                        if ([] !== $toolCalls) {
+                            yield new ToolCallComplete($toolCalls);
                         }
                     }
+
+                    // Metadata fields from the message payload.
+                    foreach (['model', 'messageId', 'requestId', 'serviceRequestId'] as $key) {
+                        if (isset($data[$key])) {
+                            yield new MetadataDelta($key, $data[$key]);
+                        }
+                    }
+
+                    if (null !== ($tokenUsage = self::buildTokenUsage(['outputTokens' => $data['outputTokens'] ?? null]))) {
+                        yield new MetadataDelta('token_usage', $tokenUsage);
+                    }
                     break;
 
-                case 'tool_result':
-                    $callId = (string) ($event['tool_use_id'] ?? '');
-                    if ('' !== $callId && isset($pendingToolCalls[$callId])) {
-                        yield new MetadataDelta('tool_result.'.$callId, $event['content'] ?? null);
+                case 'assistant.reasoning':
+                    // Full reasoning event (may be ephemeral). Already covered by reasoning_delta + ThinkingComplete
+                    // or by assistant.message.reasoningText above. Emit as read-only metadata for completeness.
+                    if (isset($data['content']) && '' !== (string) $data['content']) {
+                        yield new MetadataDelta('reasoning_full', (string) $data['content']);
                     }
+                    break;
+
+                case 'assistant.turn_end':
+                    yield new MetadataDelta('turn_end', $data);
                     break;
 
                 case 'result':
-                    if ([] !== $pendingToolCalls) {
-                        $toolCalls = array_map(
-                            static fn (array $tc) => new ToolCall($tc['id'], $tc['name'], $tc['arguments']),
-                            array_values($pendingToolCalls),
-                        );
-                        $pendingToolCalls = [];
-                        yield new ToolCallComplete($toolCalls);
+                    // Terminal event — emit session-level metadata and stop.
+                    if (isset($event['sessionId'])) {
+                        yield new MetadataDelta('sessionId', (string) $event['sessionId']);
                     }
-
-                    foreach (['session_id', 'request_id', 'duration_ms'] as $key) {
-                        if (isset($event[$key])) {
-                            yield new MetadataDelta($key, $event[$key]);
+                    if (isset($event['exitCode'])) {
+                        yield new MetadataDelta('exitCode', (int) $event['exitCode']);
+                    }
+                    $cliUsage = \is_array($event['usage'] ?? null) ? $event['usage'] : [];
+                    foreach (['premiumRequests', 'totalApiDurationMs', 'sessionDurationMs', 'codeChanges'] as $field) {
+                        if (isset($cliUsage[$field])) {
+                            yield new MetadataDelta($field, $cliUsage[$field]);
                         }
-                    }
-
-                    if (null !== ($tokenUsage = self::buildTokenUsage($event['usage'] ?? null))) {
-                        yield new MetadataDelta('token_usage', $tokenUsage);
-                    }
-
-                    if (isset($event['content']) && \is_string($event['content']) && '' !== $event['content']) {
-                        yield new TextDelta($event['content']);
                     }
                     return;
 
-                // Unknown events are ignored for forward-compatibility.
+                // Unknown event types are silently ignored for forward-compatibility.
             }
         }
     }
@@ -211,6 +268,12 @@ final class ResultConverter implements ResultConverterInterface
 
         if (null !== ($tokenUsage = self::buildTokenUsage($data['usage'] ?? null))) {
             $metadata->add('token_usage', $tokenUsage);
+        }
+
+        foreach (['premiumRequests', 'totalApiDurationMs', 'sessionDurationMs', 'codeChanges'] as $field) {
+            if (null !== ($data[$field] ?? null)) {
+                $metadata->add($field, $data[$field]);
+            }
         }
     }
 

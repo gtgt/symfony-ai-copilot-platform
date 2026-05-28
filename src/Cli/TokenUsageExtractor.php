@@ -10,9 +10,11 @@ use Symfony\AI\Platform\TokenUsage\TokenUsageExtractorInterface;
 use Symfony\AI\Platform\TokenUsage\TokenUsageInterface;
 
 /**
- * Extracts token usage from GitHub Copilot CLI agent results (JSONL terminal result event).
+ * Extracts token usage from GitHub Copilot CLI agent results.
  *
- * Copilot CLI uses snake_case field names: input_tokens, output_tokens.
+ * The Copilot CLI reports token counts on the {@code assistant.message} event
+ * ({@code data.outputTokens}), which {@see RawProcessResult::getData()} normalises
+ * into {@code usage.outputTokens}. Input/cache tokens are not exposed by the CLI.
  */
 final class TokenUsageExtractor implements TokenUsageExtractorInterface
 {
@@ -28,11 +30,10 @@ final class TokenUsageExtractor implements TokenUsageExtractorInterface
             return null;
         }
 
-        // Copilot CLI uses snake_case; also handle camelCase for forward-compatibility.
-        $input = isset($usage['input_tokens']) ? (int) $usage['input_tokens'] : (isset($usage['inputTokens']) ? (int) $usage['inputTokens'] : null);
-        $output = isset($usage['output_tokens']) ? (int) $usage['output_tokens'] : (isset($usage['outputTokens']) ? (int) $usage['outputTokens'] : null);
-        $cacheRead = isset($usage['cache_read_input_tokens']) ? (int) $usage['cache_read_input_tokens'] : (isset($usage['cacheReadTokens']) ? (int) $usage['cacheReadTokens'] : null);
-        $cacheWrite = isset($usage['cache_creation_input_tokens']) ? (int) $usage['cache_creation_input_tokens'] : (isset($usage['cacheWriteTokens']) ? (int) $usage['cacheWriteTokens'] : null);
+        $input = isset($usage['inputTokens']) ? (int) $usage['inputTokens'] : null;
+        $output = isset($usage['outputTokens']) ? (int) $usage['outputTokens'] : null;
+        $cacheRead = isset($usage['cacheReadTokens']) ? (int) $usage['cacheReadTokens'] : null;
+        $cacheWrite = isset($usage['cacheWriteTokens']) ? (int) $usage['cacheWriteTokens'] : null;
 
         if (null === $input && null === $output && null === $cacheRead && null === $cacheWrite) {
             return null;
